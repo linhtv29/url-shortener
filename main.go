@@ -7,12 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gorilla/mux"
 )
-
-type HandlerViaStruct struct {
-}
 
 type Store interface {
 	Add(shortenedURL, longURL string) error
@@ -74,7 +72,7 @@ func (a *AddPath) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h:= sha1.New()
+	h := sha1.New()
 	h.Write([]byte(parsed.URL))
 	sum := h.Sum(nil)
 	hash := hex.EncodeToString(sum)[:10]
@@ -89,11 +87,11 @@ func (a *AddPath) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	type addPathResponse struct {
 		ShortenedURL string `json:"shortened_url"`
-		LongURL string `json:"long_url"`
+		LongURL      string `json:"long_url"`
 	}
 	pathResp := addPathResponse{
 		ShortenedURL: fmt.Sprintf("%v/%v", a.domain, hash),
-		LongURL: parsed.URL,
+		LongURL:      parsed.URL,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -143,19 +141,113 @@ func (p *RedirectPath) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, longURL, http.StatusTemporaryRedirect)
 }
-func (h *HandlerViaStruct) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Print("Hello world received a request")
-	defer log.Print("Hello world finished")
-	fmt.Fprint(w, "Hello world via struct")
+
+// internal store
+type internalStore struct {
+	Version string            `json:"version"`
+	Items   map[string]string `json:"items"`
+}
+
+type FileStore struct {
+	filenane string
+}
+
+func (s *FileStore) Add(shortenedURL, longURL string) error {
+	raw, err := os.ReadFile(s.filenane)
+	if err != nil {
+		return err
+	}
+	var is internalStore
+	err = json.Unmarshal(raw, &is)
+	if err != nil {
+		return fmt.Errorf("unable to parse incoming JSON store data. Error: %v", err)
+	}
+	_, ok := is.Items[shortenedURL]
+	if ok {
+		return fmt.Errorf("shortened URL already exists")
+	}
+	is.Items[shortenedURL] = longURL
+	modraw, err := json.Marshal(is)
+	if err != nil {
+		return fmt.Errorf("unable to generate JSON representation for file")
+	}
+
+	err = os.WriteFile(s.filenane, modraw, 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *FileStore) Remove(shortenedURL string) error {
+	raw, err := os.ReadFile(s.filenane)
+	if err != nil {
+		return err
+	}
+	var is internalStore
+	err = json.Unmarshal(raw, &is)
+	if err != nil {
+		return fmt.Errorf("unable to parse incoming JSON store data. Error: %v", err)
+	}
+	_, ok := is.Items[shortenedURL]
+	if !ok {
+		return fmt.Errorf("shortened URL does not exist")
+	}
+	delete(is.Items, shortenedURL)
+	modraw, err := json.Marshal(is)
+	if err != nil {
+		return fmt.Errorf("unable to generate JSON representation for file")
+	}
+	err = os.WriteFile(s.filenane, modraw, 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *FileStore) Get(shortenedURL string) (string, error) {
+	raw, err := os.ReadFile(s.filenane)
+	if err != nil {
+		return "", err
+	}
+	var is internalStore
+	err = json.Unmarshal(raw, &is)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse incoming JSON store data. Error: %v", err)
+	}
+	longURL, ok := is.Items[shortenedURL]
+	if !ok {
+		return "", fmt.Errorf("shortened URL does not exist")
+	}
+	return longURL, nil
+}
+
+func NewFileStore(filename string) (FileStore, error) {
+	_, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		is := internalStore{Version: "1.0", Items: make(map[string]string)}
+		raw, err := json.Marshal(is)
+		if err != nil {
+			return FileStore{}, fmt.Errorf("unable to generate JSON representation for file")
+		}
+
+		err = os.WriteFile(filename, raw, 0644)
+		if err != nil {
+			return FileStore{}, fmt.Errorf("unable to write to file")
+		}
+	}
+	return FileStore{filenane: filename}, nil
 }
 
 func main() {
 	log.Print("Hello world started")
 	r := mux.NewRouter()
-	r.Handle("/", &HandlerViaStruct{}).Methods("GET")
- 	mem := NewMemoryStore()
-	r.Handle("/add", &AddPath{domain: "http://localhost:8080", store: mem}).Methods("POST")
-	r.Handle("/{hash}", &DeletePath{store: mem}).Methods("DELETE")
-	r.Handle("/{hash}", &RedirectPath{store: mem}).Methods("GET")
+	fs, err := NewFileStore("store.json")
+	if err != nil {
+		panic("unable to create file store")
+	}
+	r.Handle("/add", &AddPath{domain: "http://localhost:8080", store: &fs}).Methods("POST")
+	r.Handle("/{hash}", &DeletePath{store: &fs}).Methods("DELETE")
+	r.Handle("/{hash}", &RedirectPath{store: &fs}).Methods("GET")
 	http.ListenAndServe(":8080", r)
 }
